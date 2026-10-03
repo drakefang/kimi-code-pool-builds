@@ -4,8 +4,17 @@
 官方源码基线 `f67e6398fb3210ad8ace970e2dfd5bcc984ed61f`（2.1.1），上游为
 [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code)。MIT 许可和原版权通知见 LICENSE。
 
-固定 tag 为 `kimi-2.1.1-pool-v1`。普通环境下载单 SEA `kimi.exe`，无需 Node、pnpm 或重新打包。
-需要 Python 3.11+ 和已登录的 GitHub CLI（gh）；从本仓库检出后运行：
+固定 tag 为 `kimi-2.1.1-pool-v1.1`。普通环境下载单 SEA `kimi.exe`，无需 Node、pnpm 或重新打包。
+需要 Python 3.11+ 和已登录的 GitHub CLI（gh）；按固定 tag 检出后运行：
+
+```powershell
+git clone --branch kimi-2.1.1-pool-v1.1 --single-branch https://github.com/drakefang/kimi-code-pool-builds.git
+cd kimi-code-pool-builds
+```
+
+仓库 `.gitattributes` 保留精确字节，即使 Windows core.autocrlf=true 也不改写 patch/LICENSE。初版 v1 的远端下载在该设置下被许可 hash 门禁拦截，已撤下；v1.1 只修复发布仓库检出约束，exe、recipe、ZIP 与 consumer receipt 不变。
+
+运行：
 
 ```powershell
 python tools/kimi_subagent_pool/download.py --release-lock release-lock.json --cache-root <新的专用cache目录>

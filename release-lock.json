@@ -6,6 +6,6 @@
   "recipe_id": "9d9c535aee3213fd47bba2c48a7e44137ee2981052f21890ec47931e11cb78c3",
   "repository": "drakefang/kimi-code-pool-builds",
   "schema": "nxrouter-kimi-release-lock/v1",
-  "tag": "kimi-2.1.1-pool-v1",
+  "tag": "kimi-2.1.1-pool-v1.1",
   "verification_receipt_sha256": "9a5257de0cd83fcf709ff425e1b05e44681510dd17b067f429b3c100f27a5b37"
 }
