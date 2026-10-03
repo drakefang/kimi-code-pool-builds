@@ -1,0 +1,938 @@
+diff --git a/apps/kimi-code/src/main.ts b/apps/kimi-code/src/main.ts
+index f95d57c2a..bb65e3852 100644
+--- a/apps/kimi-code/src/main.ts
++++ b/apps/kimi-code/src/main.ts
+@@ -161,6 +161,10 @@ const MIGRATE_CLI_OPTIONS: CLIOptions = {
+ };
+ 
+ export function main(): void {
++  if (process.argv.includes('--print-capabilities')) {
++    process.stdout.write(JSON.stringify({ schema: 'kimi-code-capabilities/v1', engine: 'v2', features: ['subagent-pool-entry/v1', 'subagent-binding-replay/v1'] }) + '\n');
++    return;
++  }
+   process.title = PROCESS_NAME;
+   installCrashHandlers();
+   // A staged native update is swapped in and re-exec'd here, before any other
+diff --git a/apps/kimi-code/src/tui/commands/config.ts b/apps/kimi-code/src/tui/commands/config.ts
+index b1d71ce88..de7521a1e 100644
+--- a/apps/kimi-code/src/tui/commands/config.ts
++++ b/apps/kimi-code/src/tui/commands/config.ts
+@@ -186,7 +186,16 @@ export async function handleModelCommand(host: SlashCommandHost, args: string):
+ export async function handleSecondaryModelCommand(host: SlashCommandHost, args: string): Promise<void> {
+   const alias = args.trim();
+   await refreshModelsForPicker(host);
+-  const models = pickerModelsForHost(host);
++  const canonicalModels = pickerModelsForHost(host);
++  const secondary = (await host.harness.getConfig()).secondaryModel;
++  const hasPoolEntries = Object.values(secondary?.models ?? {}).some((entry) => typeof entry !== 'string');
++  const models = !hasPoolEntries ? canonicalModels : Object.fromEntries(
++    Object.entries(secondary!.models!).flatMap(([choice, entry]) => {
++      const model = canonicalModels[typeof entry === 'string' ? choice : entry.model];
++      if (model === undefined) return [];
++      return [[choice, { ...model, displayName: typeof entry === 'string' ? model.displayName : `${choice}: ${entry.description} (${entry.model}, ${entry.effort})` }]];
++    }),
++  );
+   // The pool reserves `primary` as the symbolic "caller's own model" choice —
+   // a user alias with that name can never be the subagent default.
+   delete models[PRIMARY_SUBAGENT_MODEL_CHOICE];
+@@ -204,10 +213,9 @@ export async function handleSecondaryModelCommand(host: SlashCommandHost, args:
+     return;
+   }
+   if (alias.length > 0 && models[alias] === undefined) {
+-    host.showError(`Unknown model alias: ${alias}`);
++    host.showError(`${hasPoolEntries ? 'Unknown pool choice' : 'Unknown model alias'}: ${alias}`);
+     return;
+   }
+-  const secondary = (await host.harness.getConfig()).secondaryModel;
+   // The v2 engine honors a lone legacy `model` key as the fallback pool
+   // default — reflect it as the picker's current value.
+   const current = secondary?.defaultModel ?? secondary?.model ?? '';
+@@ -574,11 +582,17 @@ function showSecondaryModelPicker(
+  * new value up on its own.
+  */
+ async function performSecondaryModelSave(host: SlashCommandHost, alias: string): Promise<void> {
+-  const displayName = modelDisplayName(alias, host.state.appState.availableModels[alias]);
++  let displayName = modelDisplayName(alias, host.state.appState.availableModels[alias]);
+   try {
+     const config = await host.harness.getConfig({ reload: true });
++    const selected = config.secondaryModel?.models?.[alias];
++    if (typeof selected === 'object') displayName = `${alias} (${selected.model}, ${selected.effort})`;
+     const existing = config.secondaryModel?.models;
+-    const patch: { defaultModel: string; models?: Record<string, string> } = {
++    if (Object.values(existing ?? {}).some((entry) => typeof entry !== 'string') && !Object.hasOwn(existing!, alias)) {
++      host.showError(`Unknown pool choice: ${alias}`);
++      return;
++    }
++    const patch: { defaultModel: string; models?: typeof existing } = {
+       defaultModel: alias,
+     };
+     if (existing !== undefined) {
+diff --git a/apps/kimi-code/test/tui/commands/secondary-model.test.ts b/apps/kimi-code/test/tui/commands/secondary-model.test.ts
+index 9bce58d4c..67f6836cf 100644
+--- a/apps/kimi-code/test/tui/commands/secondary-model.test.ts
++++ b/apps/kimi-code/test/tui/commands/secondary-model.test.ts
+@@ -31,7 +31,7 @@ function model(name: string): ModelAlias {
+ }
+ 
+ function makeHost(options?: {
+-  readonly secondaryModel?: { defaultModel?: string; models?: Record<string, string> };
++  readonly secondaryModel?: { defaultModel?: string; models?: Record<string, string | { model: string; effort: string; description: string }> };
+ }) {
+   const appState = {
+     availableModels: {
+@@ -88,6 +88,17 @@ function mountedPicker(host: { mountEditorReplacement: ReturnType<typeof vi.fn>
+ }
+ 
+ describe('handleSecondaryModelCommand', () => {
++  it('selects pool-only choices and preserves independent entry fields', async () => {
++    const models = { t1: { model: 'cheap', effort: 'low', description: 'Quick' }, t2: { model: 'cheap', effort: 'high', description: 'Deep' } };
++    const { host } = makeHost({ secondaryModel: { defaultModel: 't2', models } });
++    await handleSecondaryModelCommand(host, 't1');
++    const picker = mountedPicker(host);
++    expect(Object.keys(picker.models)).toEqual(['t1', 't2']);
++    expect(picker.models['t1']?.displayName).toContain('Quick');
++    picker.onSelect({ alias: 't1' });
++    await vi.waitFor(() => expect(host.harness.setConfig).toHaveBeenCalledWith({ secondaryModel: { defaultModel: 't1', models } }));
++    expect(host.state.appState.availableModels['t1']).toBeUndefined();
++  });
+   it('opens the picker filtered to user models, with the configured default as current', async () => {
+     const { host } = makeHost({ secondaryModel: { defaultModel: 'cheap' } });
+ 
+diff --git a/packages/agent-core-v2/src/agent/profile/profile.ts b/packages/agent-core-v2/src/agent/profile/profile.ts
+index b70607a65..4b8c32cc5 100644
+--- a/packages/agent-core-v2/src/agent/profile/profile.ts
++++ b/packages/agent-core-v2/src/agent/profile/profile.ts
+@@ -24,7 +24,15 @@ export class ProfileError extends Error2 {
+   }
+ }
+ 
++export interface SubagentModelBinding {
++  readonly source: 'pool_entry';
++  readonly choice: string;
++  readonly model: string;
++  readonly effort: string;
++}
++
+ export interface AgentConfigData {
++  readonly subagentBinding?: SubagentModelBinding;
+   modelAlias?: string;
+   modelCapabilities: ModelCapability;
+   profileName?: string;
+@@ -67,6 +75,7 @@ export type ProfileUpdateData = Partial<{
+ }>;
+ 
+ export interface ProfileBindingSnapshot {
++  readonly subagentBinding?: SubagentModelBinding;
+   readonly modelAlias?: string;
+   readonly profileName?: string;
+   readonly thinkingLevel: string;
+@@ -104,6 +113,7 @@ export interface ProfileSetModelResult {
+ }
+ 
+ export interface BindAgentInput {
++  readonly subagentBinding?: SubagentModelBinding;
+   readonly profile: string;
+   readonly model?: string;
+   readonly thinking?: string;
+diff --git a/packages/agent-core-v2/src/agent/profile/profileOps.ts b/packages/agent-core-v2/src/agent/profile/profileOps.ts
+index ef2246283..2cea0525c 100644
+--- a/packages/agent-core-v2/src/agent/profile/profileOps.ts
++++ b/packages/agent-core-v2/src/agent/profile/profileOps.ts
+@@ -7,9 +7,10 @@ import { AgentEvent2 } from '#/app/event/event2';
+ import type { ThinkingEffort } from '#human/llm/thinking';
+ import { defineState } from '#/state/state';
+ 
+-import { ProfileError, ProfileErrors } from './profile';
++import { ProfileError, ProfileErrors, type SubagentModelBinding } from './profile';
+ 
+ export interface ProfileModelState {
++  readonly subagentBinding?: SubagentModelBinding;
+   readonly modelAlias?: string;
+   readonly profileName?: string;
+   readonly thinkingLevel: string;
+@@ -21,7 +22,10 @@ export interface ProfileModelState {
+   readonly subagents?: readonly string[];
+ }
+ 
++const subagentBindingSchema = z.object({ source: z.literal('pool_entry'), choice: z.string().min(1), model: z.string().min(1), effort: z.string().min(1) }).strict();
++
+ const profileBindSchema = z.object({
++  subagentBinding: subagentBindingSchema.optional(),
+   agentId: z.string(),
+   modelAlias: z.string().optional(),
+   profileName: z.string().optional(),
+@@ -41,6 +45,7 @@ export class ProfileBind extends AgentEvent2<z.infer<typeof profileBindSchema>>
+   static override readonly schema = profileBindSchema;
+ }
+ export interface ProfileBind {
++  readonly subagentBinding?: SubagentModelBinding;
+   readonly agentId: string;
+   readonly modelAlias?: string;
+   readonly profileName?: string;
+@@ -135,18 +140,28 @@ export const profileKey = defineState(
+     renderGeneration: 0,
+   }),
+ ).replayable({ schema: z.custom<ProfileModelState>() })
+-  .on(ProfileBind, (s, e) => ({
+-    modelAlias: e.modelAlias ?? s.modelAlias,
+-    profileName: e.profileName ?? s.profileName,
+-    thinkingLevel: e.thinkingEffort,
+-    systemPrompt: e.systemPrompt,
+-    environmentDisclosure: e.environmentDisclosure,
+-    renderGeneration: e.renderGeneration ?? s.renderGeneration + 1,
+-    agentsMdPaths: e.agentsMdPaths ?? s.agentsMdPaths,
+-    disallowedTools: e.disallowedTools,
+-    subagents: e.subagents,
+-  }))
++  .on(ProfileBind, (s, e) => {
++    const binding = s.subagentBinding;
++    if (binding !== undefined && (e.subagentBinding === undefined || e.subagentBinding.choice !== binding.choice || e.subagentBinding.model !== binding.model || e.subagentBinding.effort !== binding.effort || e.modelAlias !== binding.model || e.thinkingEffort !== binding.effort)) {
++      throw new Error('Subagent pool entry binding is immutable');
++    }
++    return {
++      subagentBinding: e.subagentBinding ?? s.subagentBinding,
++      modelAlias: e.modelAlias ?? s.modelAlias,
++      profileName: e.profileName ?? s.profileName,
++      thinkingLevel: e.thinkingEffort,
++      systemPrompt: e.systemPrompt,
++      environmentDisclosure: e.environmentDisclosure,
++      renderGeneration: e.renderGeneration ?? s.renderGeneration + 1,
++      agentsMdPaths: e.agentsMdPaths ?? s.agentsMdPaths,
++      disallowedTools: e.disallowedTools,
++      subagents: e.subagents,
++    };
++  })
+   .on(ConfigUpdate, (s, e) => {
++    if (s.subagentBinding !== undefined && ((e.modelAlias !== undefined && e.modelAlias !== s.subagentBinding.model) || (configUpdateThinkingLevel(e) !== undefined && configUpdateThinkingLevel(e) !== s.subagentBinding.effort))) {
++      throw new Error('Subagent pool entry binding is immutable');
++    }
+     if (e.modelAlias !== undefined && e.modelAlias !== s.modelAlias) {
+       s.modelAlias = e.modelAlias;
+     }
+diff --git a/packages/agent-core-v2/src/agent/profile/profileService.ts b/packages/agent-core-v2/src/agent/profile/profileService.ts
+index 887907d30..2de9eb9e1 100644
+--- a/packages/agent-core-v2/src/agent/profile/profileService.ts
++++ b/packages/agent-core-v2/src/agent/profile/profileService.ts
+@@ -1,3 +1,4 @@
++import { assertPoolEntryEffort } from '#/session/subagent/configSection';
+ import { Disposable } from '#/_base/di/lifecycle';
+ import { LifecycleScope } from '#/app/scopes';
+ import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+@@ -222,6 +223,8 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+   }
+ 
+   update(changed: ProfileUpdateData): void {
++    const binding = this.profileState.subagentBinding;
++    if (binding !== undefined && ((changed.modelAlias !== undefined && changed.modelAlias !== binding.model) || (changed.thinkingLevel !== undefined && changed.thinkingLevel !== binding.effort))) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Subagent pool entry binding is immutable');
+     const { activeToolNames, ...configChanged } = changed;
+     if (
+       changed.profileName !== undefined &&
+@@ -239,6 +242,11 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+   }
+ 
+   applyBindingSnapshot(snapshot: ProfileBindingSnapshot): void {
++    if (snapshot.subagentBinding !== undefined) {
++      const binding = snapshot.subagentBinding;
++      if (this.scopeContext.agentId === 'main' || snapshot.modelAlias !== binding.model || snapshot.thinkingLevel !== binding.effort) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Invalid child pool binding snapshot');
++      assertPoolEntryEffort(binding.choice, binding.model, binding.effort, this.modelCatalog.get(binding.model));
++    }
+     this.activeProfile = undefined;
+     this.activeToolNamesOverlay = undefined;
+     const agentsMdPaths =
+@@ -246,6 +254,7 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+     void this.dispatcher.dispatch(
+       new ProfileBind({
+         agentId: this.scopeContext.agentId,
++        subagentBinding: snapshot.subagentBinding,
+         modelAlias: snapshot.modelAlias,
+         profileName: snapshot.profileName,
+         thinkingEffort: snapshot.thinkingLevel,
+@@ -271,6 +280,8 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+   }
+ 
+   async bind(input: BindAgentInput): Promise<void> {
++    const existingBinding = this.profileState.subagentBinding;
++    if (existingBinding !== undefined && (input.subagentBinding?.choice !== existingBinding.choice || input.model !== existingBinding.model || input.thinking !== existingBinding.effort)) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Subagent pool entry binding is immutable');
+     await this.catalog.ready;
+     await this.identity.resolved();
+     this.assertBindable(input.profile);
+@@ -294,6 +305,10 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+       );
+     }
+     const model = this.modelCatalog.get(alias);
++    if (input.subagentBinding !== undefined) {
++      if (this.scopeContext.agentId === 'main' || input.subagentBinding.model !== alias || input.subagentBinding.effort !== input.thinking) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Invalid child pool binding');
++      assertPoolEntryEffort(input.subagentBinding.choice, alias, input.subagentBinding.effort, model);
++    }
+ 
+     if (input.strictThinking === true && input.thinking !== undefined) {
+       this.assertThinkingEffortSupported(input.thinking, model, alias);
+@@ -307,7 +322,7 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+     this.activeProfile = profile;
+     this.cacheAgentsMdWarning(context);
+ 
+-    const thinkingLevel = this.resolveThinkingEffort(
++    const thinkingLevel = input.subagentBinding?.effort ?? this.resolveThinkingEffort(
+       input.thinking ?? (currentProfileName !== undefined ? this.thinkingLevel : undefined),
+       model,
+     );
+@@ -315,6 +330,7 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+     this.activeToolNamesOverlay = undefined;
+     await this.dispatcher.dispatch(new ProfileBind({
+       agentId: this.scopeContext.agentId,
++      subagentBinding: input.subagentBinding,
+       modelAlias: alias,
+       profileName: profile.name,
+       thinkingEffort: thinkingLevel,
+@@ -423,6 +439,7 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+   data(): ProfileData {
+     const model = this.tryResolveRawModel();
+     return {
++      subagentBinding: this.profileState.subagentBinding,
+       modelAlias: this.modelAlias,
+       modelCapabilities: model?.capabilities ?? UNKNOWN_CAPABILITY,
+       profileName: this.profileName,
+@@ -674,6 +691,13 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
+     readonly effective: ThinkingEffort;
+     readonly forced: ThinkingEffort | undefined;
+   } {
++    const binding = this.profileState.subagentBinding;
++    if (binding !== undefined) {
++      const boundModel = this.modelCatalog.get(binding.model);
++      if (this.modelAlias !== binding.model || this.profileState.thinkingLevel !== binding.effort) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Subagent pool binding no longer matches profile');
++      assertPoolEntryEffort(binding.choice, binding.model, binding.effort, boundModel);
++      return { effective: binding.effort, forced: undefined };
++    }
+     const base = this.thinkingLevel;
+     const forced = resolveForcedThinkingEffort(
+       this.config.get<ThinkingConfig>(THINKING_SECTION)?.forcedEffort,
+diff --git a/packages/agent-core-v2/src/app/config/configService.ts b/packages/agent-core-v2/src/app/config/configService.ts
+index e4fefd88e..1573a1a47 100644
+--- a/packages/agent-core-v2/src/app/config/configService.ts
++++ b/packages/agent-core-v2/src/app/config/configService.ts
+@@ -742,6 +742,7 @@ export class ConfigService extends Disposable implements IConfigService {
+       try {
+         validated[domain] = this.registry.validate(domain, value);
+       } catch (error) {
++        if (domain === 'secondaryModel') throw error;
+         this.pushDiagnostic({
+           domain,
+           severity: 'warning',
+@@ -854,7 +855,8 @@ export class ConfigService extends Disposable implements IConfigService {
+         const validatedValue = this.registry.validate(domain, this.raw[domain]);
+         this.validated[domain] = validatedValue;
+         this.effective[domain] = validatedValue;
+-      } catch {
++      } catch (error) {
++        if (domain === 'secondaryModel') throw error;
+         return;
+       }
+     } else if (section.defaultValue !== undefined && this.effective[domain] === undefined) {
+diff --git a/packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts b/packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts
+index e8be999f9..29962b10e 100644
+--- a/packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts
++++ b/packages/agent-core-v2/src/session/agentLifecycle/agentLifecycleService.ts
+@@ -423,11 +423,18 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
+     const source = sourceManaged.handle;
+     const sourceData = source.accessor.get(IAgentProfileService).data();
+     const override = opts?.binding;
++    if (sourceData.subagentBinding !== undefined && ((override?.model !== undefined && override.model !== sourceData.modelAlias) || (override?.thinking !== undefined && override.thinking !== sourceData.thinkingLevel))) {
++      throw new Error2(ErrorCodes.CONFIG_INVALID, 'Fork cannot override an immutable pool entry binding');
++    }
++    if (Object.keys(opts?.labels ?? {}).some((key) => key.startsWith('kimi.pool.'))) {
++      throw new Error2(ErrorCodes.CONFIG_INVALID, 'Reserved pool binding labels cannot be supplied');
++    }
++    const inheritedLabels = sourceData.subagentBinding === undefined ? opts?.labels : { ...opts?.labels, 'kimi.pool.source': sourceData.subagentBinding.source, 'kimi.pool.choice': sourceData.subagentBinding.choice, 'kimi.pool.model': sourceData.subagentBinding.model, 'kimi.pool.effort': sourceData.subagentBinding.effort };
+     const childContext = await this.create({
+       agentId: opts?.agentId,
+       runtimeId: source.accessor.get(IAgentRuntimeBindingService).current.runtimeId,
+       forkedFrom: source.id,
+-      labels: withSubagentProfile(opts?.labels, override?.profile ?? sourceData.profileName),
++      labels: withSubagentProfile(inheritedLabels, override?.profile ?? sourceData.profileName),
+     });
+     const child = this.requireManaged(childContext).handle;
+ 
+@@ -437,6 +444,7 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
+         profile: override.profile,
+         model: override.model ?? sourceData.modelAlias,
+         thinking: override?.thinking ?? sourceData.thinkingLevel,
++        subagentBinding: sourceData.subagentBinding,
+       });
+     } else {
+       childProfile.applyBindingSnapshot(sourceData);
+diff --git a/packages/agent-core-v2/src/session/subagent/configSection.ts b/packages/agent-core-v2/src/session/subagent/configSection.ts
+index 025298bda..7bdc1d22c 100644
+--- a/packages/agent-core-v2/src/session/subagent/configSection.ts
++++ b/packages/agent-core-v2/src/session/subagent/configSection.ts
+@@ -28,9 +28,15 @@ export const SubagentConfigSchema = z.object({
+ 
+ export type SubagentConfig = z.infer<typeof SubagentConfigSchema>;
+ 
++export const SubagentPoolEntrySchema = z.object({
++  model: z.string().min(1),
++  effort: z.string().min(1).refine((value) => value.trim() === value && value !== 'on' && value !== 'off'),
++  description: z.string(),
++}).strict();
++
+ export const SecondaryModelConfigSchema = z.object({
+   defaultModel: z.string().min(1).optional(),
+-  models: z.record(z.string(), z.string()).optional(),
++  models: z.record(z.string(), z.union([z.string(), SubagentPoolEntrySchema])).optional(),
+   force: z.boolean().optional(),
+   model: z.string().min(1).optional(),
+   maxContextSize: z.number().int().min(1).optional(),
+@@ -84,7 +90,7 @@ export const PRIMARY_SUBAGENT_MODEL_CHOICE = 'primary';
+ 
+ export interface SubagentModelPool {
+   readonly defaultModel?: string;
+-  readonly models: Record<string, string>;
++  readonly models: Record<string, string | { model: string; effort: string; description: string }>;
+ }
+ 
+ export function resolveSubagentModelPool(config: IConfigService): SubagentModelPool | undefined {
+@@ -149,7 +155,9 @@ export function assertValidSubagentModelPool(
+   }
+   for (const alias of aliases) {
+     try {
+-      modelCatalog.get(alias);
++      const entry = pool.models[alias]!;
++      const model = modelCatalog.get(typeof entry === 'string' ? alias : entry.model);
++      if (typeof entry !== 'string') assertPoolEntryEffort(alias, entry.model, entry.effort, model);
+     } catch (error) {
+       throw new Error2(
+         ErrorCodes.CONFIG_INVALID,
+@@ -165,6 +173,9 @@ export function assertValidSubagentModelConfig(
+   modelCatalog: IModelCatalog,
+ ): void {
+   const section = config.get<SecondaryModelConfig | undefined>(SECONDARY_MODEL_SECTION);
++  if (Object.values(section?.models ?? {}).some((entry) => typeof entry !== 'string') && section?.model !== undefined) {
++    throw new Error2(ErrorCodes.CONFIG_INVALID, '[secondary_model] object pool entries cannot be combined with legacy model metadata synthesis');
++  }
+   if (section?.force === true) {
+     if (section.models !== undefined) {
+       throw new Error2(ErrorCodes.CONFIG_INVALID, SECONDARY_MODEL_FORCE_EXCLUDES_MODELS_MESSAGE, {
+@@ -193,6 +204,7 @@ function assertValidSubagentDefaultEffort(
+       : normalizeRequestedThinkingEffort(section.defaultEffort);
+   if (effort === undefined || pool === undefined) return;
+   for (const alias of Object.keys(pool.models)) {
++    if (typeof pool.models[alias] !== 'string') continue;
+     const model = modelCatalog.get(alias);
+     if (effort === 'off' && model.alwaysThinking === true) {
+       throw new Error2(
+@@ -244,8 +256,11 @@ export function resolveSubagentBinding(
+   config: IConfigService,
+   own: { modelAlias: string; thinkingLevel: string },
+   requested?: string,
+-): { model: string; thinking?: string; modelSource: SubagentModelSource } {
++): { model: string; thinking?: string; modelSource: SubagentModelSource; poolChoice?: string } {
+   const section = config.get<SecondaryModelConfig | undefined>(SECONDARY_MODEL_SECTION);
++  if (Object.values(section?.models ?? {}).some((entry) => typeof entry !== 'string') && section?.model !== undefined) {
++    throw new Error2(ErrorCodes.CONFIG_INVALID, '[secondary_model] object pool entries cannot be combined with legacy model metadata synthesis');
++  }
+   if (section?.force === true) {
+     if (section.models !== undefined) {
+       throw new Error2(ErrorCodes.CONFIG_INVALID, SECONDARY_MODEL_FORCE_EXCLUDES_MODELS_MESSAGE, {
+@@ -304,6 +319,10 @@ export function resolveSubagentBinding(
+       { details: { model: choice, availableModels: available } },
+     );
+   }
++  const entry = pool.models[choice]!;
++  if (typeof entry !== 'string') {
++    return { model: entry.model, thinking: entry.effort, modelSource: 'secondary_pool', poolChoice: choice };
++  }
+   return { model: choice, thinking: section?.defaultEffort, modelSource: 'secondary_pool' };
+ }
+ 
+@@ -357,7 +376,8 @@ function orderedPoolAliases(pool: SubagentModelPool): string[] {
+   return [defaultModel, ...aliases.filter((alias) => alias !== defaultModel)];
+ }
+ 
+-function formatPoolLine(label: string, description: string): string {
++function formatPoolLine(label: string, entry: SubagentModelPool['models'][string]): string {
++  const description = typeof entry === 'string' ? entry : `${entry.description} (${entry.model}, effort=${entry.effort})`;
+   return description === '' ? `- ${label}` : `- ${label}: ${description}`;
+ }
+ 
+@@ -431,3 +451,18 @@ export function formatSubagentTimeoutDescription(ms: number): string {
+   }
+   return `${ms} ms`;
+ }
++
++export function assertPoolEntryEffort(choice: string, canonical: string, effort: string, model: Model): void {
++  if (
++    effort.trim() !== effort || effort === '' || effort === 'on' || effort === 'off' ||
++    normalizeRequestedThinkingEffort(effort) !== effort ||
++    !modelSupportsThinking(model) ||
++    model.supportEfforts === undefined || !model.supportEfforts.includes(effort)
++  ) {
++    throw new Error2(
++      ErrorCodes.CONFIG_INVALID,
++      `Pool choice "${choice}" canonical model "${canonical}" does not explicitly support concrete effort "${effort}"`,
++      { details: { choice, model: canonical, effort, supportedEfforts: model.supportEfforts } },
++    );
++  }
++}
+diff --git a/packages/agent-core-v2/src/session/subagent/spawn.ts b/packages/agent-core-v2/src/session/subagent/spawn.ts
+index 6fc2c71eb..43af238fc 100644
+--- a/packages/agent-core-v2/src/session/subagent/spawn.ts
++++ b/packages/agent-core-v2/src/session/subagent/spawn.ts
+@@ -1,3 +1,4 @@
++import type { SubagentModelBinding } from '#/agent/profile/profile';
+ import { PRIMARY_SUBAGENT_MODEL_CHOICE, type SubagentModelSource } from './configSection';
+ 
+ export const DEFAULT_PROFILE_NAME = 'coder';
+@@ -52,6 +53,7 @@ export interface SubagentSpawnPlanInput {
+ }
+ 
+ export interface SubagentSpawnPlan {
++  readonly subagentBinding?: SubagentModelBinding;
+   readonly profileName: string;
+   readonly model: string;
+   readonly modelSource?: SubagentModelSource;
+diff --git a/packages/agent-core-v2/src/session/subagent/subagentService.ts b/packages/agent-core-v2/src/session/subagent/subagentService.ts
+index 9d2a0ecbc..18707f176 100644
+--- a/packages/agent-core-v2/src/session/subagent/subagentService.ts
++++ b/packages/agent-core-v2/src/session/subagent/subagentService.ts
+@@ -42,6 +42,7 @@ import {
+ import { runAgentTurn } from './runAgentTurn';
+ import {
+   resolveSubagentBinding,
++  assertPoolEntryEffort,
+   resolveSubagentThinking,
+   wrapSubagentModelError,
+ } from './configSection';
+@@ -91,7 +92,9 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+     const caller = this.requireCaller(input.callerAgentId);
+     const fork = input.fork === true;
+     await this.catalog.ready;
+-    const own = caller.accessor.get(IAgentProfileService).data();
++    const callerProfile = caller.accessor.get(IAgentProfileService);
++    const own = callerProfile.data();
++    const effectiveThinking = callerProfile.getEffectiveThinkingLevel();
+     const requested = input.profileName !== undefined && input.profileName.length > 0
+       ? input.profileName
+       : undefined;
+@@ -127,7 +130,7 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+       ? { model: own.modelAlias, thinking: own.thinkingLevel, modelSource: 'inherited' as const }
+       : resolveSubagentBinding(
+           this.configService,
+-          { modelAlias: own.modelAlias, thinkingLevel: own.thinkingLevel },
++          { modelAlias: own.modelAlias, thinkingLevel: effectiveThinking },
+           input.model,
+         );
+     let model: Model;
+@@ -136,7 +139,12 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+     } catch (error) {
+       throw wrapSubagentModelError(error, binding.model, own.modelAlias);
+     }
++    const poolBinding = 'poolChoice' in binding && binding.poolChoice !== undefined
++      ? { source: 'pool_entry' as const, choice: binding.poolChoice!, model: binding.model, effort: binding.thinking! }
++      : binding.modelSource === 'primary_override' ? own.subagentBinding : undefined;
++    if (poolBinding !== undefined) assertPoolEntryEffort(poolBinding.choice, poolBinding.model, poolBinding.effort, model);
+     return {
++      subagentBinding: poolBinding,
+       profileName: profile?.name ?? requestedProfileName,
+       model: binding.model,
+       modelSource: binding.modelSource,
+@@ -148,6 +156,8 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+   async spawn(opts: SpawnSubagentOptions): Promise<SpawnedSubagent> {
+     const caller = this.requireCaller(opts.callerAgentId);
+     const { plan } = opts;
++    if (Object.keys(opts.labels ?? {}).some((key) => key.startsWith('kimi.pool.'))) throw new Error2(ErrorCodes.CONFIG_INVALID, 'Reserved pool binding labels cannot be supplied');
++    const labels = plan.subagentBinding === undefined ? opts.labels : { ...opts.labels, 'kimi.pool.source': plan.subagentBinding.source, 'kimi.pool.choice': plan.subagentBinding.choice, 'kimi.pool.model': plan.subagentBinding.model, 'kimi.pool.effort': plan.subagentBinding.effort };
+     const lease = plan.fork
+       ? undefined
+       : caller.accessor.get(IAgentRuntimeService).acquire(['process']);
+@@ -156,7 +166,7 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+       try {
+         if (plan.fork) {
+           const forked = await this.agentLifecycle.fork(agentContextOf(caller), {
+-            labels: opts.labels,
++            labels,
+           });
+           created = this.agentLifecycle.handleOf(forked.agentId)!;
+           created.accessor
+@@ -165,11 +175,12 @@ export class SessionSubagentService extends Service implements ISessionSubagentS
+         } else {
+           const createdContext = await this.agentLifecycle.create({
+             binding: {
++              subagentBinding: plan.subagentBinding,
+               profile: plan.profileName,
+               model: plan.model,
+               thinking: plan.thinking,
+             },
+-            labels: opts.labels,
++            labels,
+             runtimeId: lease!.runtime.identity.runtimeId,
+           });
+           created = this.agentLifecycle.handleOf(createdContext.agentId)!;
+diff --git a/packages/agent-core-v2/test/app/config/config.test.ts b/packages/agent-core-v2/test/app/config/config.test.ts
+index 19f8c8ec4..4f23f224a 100644
+--- a/packages/agent-core-v2/test/app/config/config.test.ts
++++ b/packages/agent-core-v2/test/app/config/config.test.ts
+@@ -1463,10 +1463,17 @@ describe('malformed models config entries', () => {
+     ix.set(IConfigRegistry, new SyncDescriptor(ConfigRegistry));
+     ix.set(IConfigService, new SyncDescriptor(ConfigService));
+     const config = ix.get(IConfigService);
+-    await config.ready;
++    try { await config.ready; } catch (error) { disposables.dispose(); throw error; }
+     return { config, disposables, storage };
+   }
+ 
++  it('fails closed instead of discarding an invalid structured subagent pool', async () => {
++    await expect(createConfig('[secondary_model]\ndefault_model="review"\n[secondary_model.models]\nreview={model="canonical",effort="low",description="Review",typo=true}\n')).rejects.toThrow();
++    const { config, disposables } = await createConfig('[secondary_model]\ndefault_model="review"\n[secondary_model.models]\nreview={model="canonical",effort="low",description="Review"}\n');
++    expect(config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION).models?.['review']).toEqual({model:'canonical',effort:'low',description:'Review'});
++    disposables.dispose();
++  });
++
+   it('warns at load time when a dotted alias parses as a nested table', async () => {
+     const { config, disposables } = await createConfig(
+       '[models.kimi-k2.7-code]\nmodel = "kimi-k2.7-code"\nmax_context_size = 262144\n',
+diff --git a/packages/agent-core-v2/test/features/swarm/swarm.test.ts b/packages/agent-core-v2/test/features/swarm/swarm.test.ts
+index 0be8fce99..30df65d01 100644
+--- a/packages/agent-core-v2/test/features/swarm/swarm.test.ts
++++ b/packages/agent-core-v2/test/features/swarm/swarm.test.ts
+@@ -143,7 +143,7 @@ function mockSwarmMode() {
+ function stubConfig(section?: {
+   timeoutMs?: number;
+   defaultModel?: string;
+-  models?: Record<string, string>;
++  models?: Record<string, string | { model: string; effort: string; description: string }>;
+ }): IConfigService {
+   return {
+     _serviceBrand: undefined,
+@@ -196,6 +196,7 @@ function stubCallerProfile(
+   return {
+     _serviceBrand: undefined,
+     data: () => data ?? { profileName: undefined },
++    getEffectiveThinkingLevel: () => data?.thinkingLevel ?? 'off',
+   } as unknown as IAgentProfileService;
+ }
+ 
+@@ -213,6 +214,7 @@ function realSubagents(
+ ): ISessionSubagentService {
+   const caller = {
+     _serviceBrand: undefined,
++    getEffectiveThinkingLevel: () => callerProfile.getEffectiveThinkingLevel(),
+     data: () => {
+       const data = callerProfile.data();
+       return {
+@@ -260,7 +262,7 @@ function realSubagents(
+           { details: { model: alias } },
+         );
+       }
+-      return { id: alias } as Model;
++      return { id: alias, capabilities: { thinking: true }, supportEfforts: ['low', 'high', 'max'] } as unknown as Model;
+     },
+   } as unknown as IModelCatalog;
+   const sessionContext = { _serviceBrand: undefined, cwd: '/repo' } as unknown as ISessionContext;
+@@ -1240,6 +1242,18 @@ describe('AgentSwarmTool', () => {
+     );
+   });
+ 
++  it('maps structured pool choices into immutable canonical plans for every swarm item', async () => {
++    const host = mockSwarmHost();
++    const config = stubConfig({ defaultModel: 't1', models: { t1: { model: 'provider/fast', effort: 'low', description: 'T1' } } });
++    const caller = stubCallerProfile({ modelAlias: 'main-model', thinkingLevel: 'high' });
++    const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), mockSwarmMode(), config, stubFlag(true), realSubagents(stubSwarmCatalog(), config, caller), caller);
++    await executeTool(tool, context({ description: 'Review', prompt_template: 'Review {{item}}', items: ['a', 'b'], model: 't1' }));
++    expect(host.swarmService.run).toHaveBeenCalledWith(expect.objectContaining({ tasks: [
++      expect.objectContaining({ plan: expect.objectContaining({ model: 'provider/fast', thinking: 'low', subagentBinding: { source: 'pool_entry', choice: 't1', model: 'provider/fast', effort: 'low' } }) }),
++      expect.objectContaining({ plan: expect.objectContaining({ model: 'provider/fast', thinking: 'low', subagentBinding: { source: 'pool_entry', choice: 't1', model: 'provider/fast', effort: 'low' } }) }),
++    ] }));
++  });
++
+   it('lets the tool call opt back into the primary model', async () => {
+     const host = mockSwarmHost();
+     const tool = new AgentSwarmTool(host.swarmService, makeAgentScopeContext({ agentId: host.callerAgentId, agentScope: '' }), mockSwarmMode(), stubConfig({ defaultModel: 'provider/fast', models: { 'provider/fast': 'fast and cheap' } }), stubFlag(true), realSubagents(stubSwarmCatalog(), stubConfig({ defaultModel: 'provider/fast', models: { 'provider/fast': 'fast and cheap' } }), stubCallerProfile({ modelAlias: 'main-model', thinkingLevel: 'high' })), stubCallerProfile({ modelAlias: 'main-model', thinkingLevel: 'high' }));
+diff --git a/packages/agent-core-v2/test/session/subagent/poolEntryBinding.test.ts b/packages/agent-core-v2/test/session/subagent/poolEntryBinding.test.ts
+new file mode 100644
+index 000000000..3ad1d09c0
+--- /dev/null
++++ b/packages/agent-core-v2/test/session/subagent/poolEntryBinding.test.ts
+@@ -0,0 +1,179 @@
++import { describe, expect, it } from 'vitest';
++import { produce } from 'immer';
++import { AgentProfileService } from '#/agent/profile/profileService';
++import { ProfileBind, ConfigUpdate, profileKey, type ProfileModelState } from '#/agent/profile/profileOps';
++import type { SubagentModelBinding } from '#/agent/profile/profile';
++import { SECONDARY_MODEL_SECTION, SecondaryModelConfigSchema, assertValidSubagentModelConfig, resolveSubagentBinding } from '#/session/subagent/configSection';
++import type { IModelCatalog, Model } from '#/llm-adapter/model/catalog';
++import type { FoldContext } from '#/state/state';
++import { StubConfigService } from '../../stubs';
++import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
++import { IAgentProfileService } from '#/agent/profile/profile';
++import { IAgentLoopService } from '#/agent/loop/loop';
++import { Event } from '#/_base/event';
++import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
++import { ISessionSubagentService } from '#/session/subagent/subagent';
++import { IConfigService, ConfigTarget } from '#/app/config/config';
++import { testAgent, configServices, llmGenerateServices, createScriptedGenerate, appService, sessionServices } from '../../harness';
++import { SyncDescriptor } from '#/_base/di/descriptors';
++import { IHostEnvironment } from '#/os/interface/hostEnvironment';
++import { IHostFileSystem } from '#/os/interface/hostFileSystem';
++import { IHostProcessService } from '#/os/interface/hostProcess';
++import { IHostTerminalService } from '#/os/interface/terminal';
++import { LocalRuntime } from '#/runtime/localRuntime';
++import type { Runtime, RuntimeBinding, RuntimeCapability, RuntimeLease } from '#/runtime/runtime';
++import { IRuntimeResolver } from '#/workspace/workspaceInstance/workspaceInstanceManager';
++
++const binding: SubagentModelBinding = { source: 'pool_entry', choice: 'review', model: 'canonical', effort: 'low' };
++let model = { id: 'canonical', capabilities: { thinking: true }, supportEfforts: ['low', 'high'], providerType: 'kimi' } as unknown as Model;
++const catalog = { get: (id: string) => { if (id !== 'canonical') throw new Error('unknown canonical'); return model; } } as IModelCatalog;
++const section = { defaultModel: 'review', defaultEffort: 'high', models: { review: { model: 'canonical', effort: 'low', description: 'Review code' } } };
++
++function consumer(state: ProfileModelState): AgentProfileService {
++  return Object.assign(Object.create(AgentProfileService.prototype), {
++    states: { get: () => state }, modelCatalog: catalog,
++    config: new StubConfigService({ thinking: { enabled: false, forcedEffort: 'high' } }),
++    sessionContext: { sessionId: 'test' },
++  });
++}
++
++describe('pool entry binding', () => {
++  it('resolves choice separately and overrides secondary default effort', () => {
++    const config = new StubConfigService({ [SECONDARY_MODEL_SECTION]: section });
++    assertValidSubagentModelConfig(config, catalog);
++    expect(resolveSubagentBinding(config, { modelAlias: 'caller', thinkingLevel: 'high' }, 'review')).toEqual({ model: 'canonical', thinking: 'low', modelSource: 'secondary_pool', poolChoice: 'review' });
++    expect(resolveSubagentBinding(config, { modelAlias: 'caller', thinkingLevel: 'high' }, 'primary')).toMatchObject({ model: 'caller', thinking: 'high' });
++  });
++
++  it.each(['off', 'on', 'unknown'])('rejects non-concrete or unsupported effort %s', (effort) => {
++    const config = new StubConfigService({ [SECONDARY_MODEL_SECTION]: { ...section, models: { review: { ...section.models.review, effort } } } });
++    expect(() => assertValidSubagentModelConfig(config, catalog)).toThrow();
++  });
++
++  it('rejects unknown object keys, missing descriptions and reserved primary', () => {
++    expect(SecondaryModelConfigSchema.safeParse({ ...section, models: { review: { ...section.models.review, extra: true } } }).success).toBe(false);
++    expect(SecondaryModelConfigSchema.safeParse({ ...section, models: { review: { model: 'canonical', effort: 'low' } } }).success).toBe(false);
++    expect(() => assertValidSubagentModelConfig(new StubConfigService({ [SECONDARY_MODEL_SECTION]: { defaultModel: 'primary', models: { primary: section.models.review } } }), catalog)).toThrow();
++  });
++
++  it('rejects absent canonical models and unknown support lists', () => {
++    expect(() => assertValidSubagentModelConfig(new StubConfigService({ [SECONDARY_MODEL_SECTION]: { ...section, models: { review: { ...section.models.review, model: 'missing' } } } }), catalog)).toThrow();
++    expect(() => assertValidSubagentModelConfig(new StubConfigService({ [SECONDARY_MODEL_SECTION]: section }), { get: () => ({ ...model, supportEfforts: undefined }) } as unknown as IModelCatalog)).toThrow();
++  });
++
++  it('preserves legacy string entries and rejects legacy metadata synthesis with objects', () => {
++    assertValidSubagentModelConfig(new StubConfigService({ [SECONDARY_MODEL_SECTION]: { defaultModel: 'canonical', models: { canonical: 'Legacy description' } } }), catalog);
++    expect(() => assertValidSubagentModelConfig(new StubConfigService({ [SECONDARY_MODEL_SECTION]: { ...section, model: 'canonical' } }), catalog)).toThrow();
++  });
++
++  it('replays durable binding and bypasses global thinking overrides at both request consumers', () => {
++    const payload = ProfileBind.schema.parse({ agentId: 'child', modelAlias: 'canonical', thinkingEffort: 'low', systemPrompt: '', disallowedTools: [], subagentBinding: binding });
++    const event = new ProfileBind(JSON.parse(JSON.stringify(payload)));
++    const fold = profileKey.replayable.folds.get(ProfileBind)!;
++    const state = produce(profileKey.initial(), (draft) => { const next = fold(draft, event, {} as FoldContext); if (next !== undefined) Object.assign(draft, next); });
++    expect(state.subagentBinding).toEqual(binding);
++    const service = consumer(state);
++    expect(service.resolveModelContext().thinkingLevel).toBe('low');
++    expect(service.resolveRequestParams().thinkingEffort).toBe('low');
++    const update = profileKey.replayable.folds.get(ConfigUpdate)!;
++    expect(() => produce(state, (draft) => { update(draft, new ConfigUpdate({ agentId: 'child', thinkingEffort: 'high' }), {} as FoldContext); })).toThrow('immutable');
++    const previous = model;
++    model = { ...model, supportEfforts: ['high'] };
++    try { expect(() => service.resolveModelContext()).toThrow(); } finally { model = previous; }
++  });
++});
++
++it('captures actual concurrent child requests for five tiers and restored binding', async () => {
++  const generator = createScriptedGenerate();
++  const requests: Array<{model: string; effort?: string}> = [];
++  const choiceEntries = Object.fromEntries(['low', 'high', 'max', 'max', 'max'].map((effort, i) => [`t${i + 1}`, { model: i < 3 ? 'flash' : `kimi${i}`, effort, description: `T${i + 1}` }]));
++  const config = {
++    providers: { synthetic: { type: 'openai_responses' as const, apiKey: 'synthetic', baseUrl: 'https://example.test/v1' } },
++    models: Object.fromEntries(['flash', 'kimi3', 'kimi4'].map(id => [id, { provider: 'synthetic', model: id, maxContextSize: 8192, capabilities: ['thinking', 'tool_use', 'always_thinking'], supportEfforts: ['low', 'high', 'max'], defaultEffort: 'max' }])),
++    defaultModel: 'flash', thinking: { enabled: false, forcedEffort: 'high' },
++    secondaryModel: { defaultModel: 't2', defaultEffort: 'high', models: choiceEntries },
++  };
++  const ctx = testAgent(appService(IAppendLogStore, new PoolTestAppendStore()),
++    sessionServices(reg => reg.defineDescriptor(IRuntimeResolver, new SyncDescriptor(PoolTestRuntimeResolver))),
++    configServices(() => config), llmGenerateServices({
++    generate: async (request, content, control) => {
++      requests.push({ model: request.model.model, effort: request.thinking?.effort });
++      await generator.requester.generate(request, content, control);
++    },
++  }));
++  try {
++    const lifecycle = ctx.get(IAgentLifecycleService);
++    const subagents = ctx.get(ISessionSubagentService);
++    const childProfiles: Array<IAgentProfileService> = [];
++    const runChild = async (id: string) => {
++      const child = lifecycle.get(id) ?? await lifecycle.create({ agentId: id });
++      const handle = lifecycle.handleOf(child.agentId)!;
++      const profile = handle.accessor.get(IAgentProfileService);
++      childProfiles.push(profile);
++      generator.mockNextResponse({ type: 'text', text: 'done' });
++      const loop = handle.accessor.get(IAgentLoopService);
++      const prompt = loop.submit({ message: { role: 'user', content: [{ type: 'text', text: 'synthetic probe' }] }, meta: { origin: { kind: 'user' }, tracked: true } });
++      expect((await loop.promptHandle(prompt.id)!.completion).state).toBe('completed');
++    };
++    const spawnViaPool = async (callerAgentId: string, choice: string) => {
++      const plan = await subagents.planSpawn({ callerAgentId, model: choice });
++      const child = await subagents.spawn({ callerAgentId, plan, prompt: 'synthetic probe' });
++      await runChild(child.agentId);
++      return child.agentId;
++    };
++    const ids = await Promise.all(Object.keys(choiceEntries).map(choice => spawnViaPool('main', choice)));
++    expect(requests.map(r => `${r.model}/${r.effort}`).toSorted()).toEqual(['flash/low', 'flash/high', 'flash/max', 'kimi3/max', 'kimi4/max'].toSorted());
++    config.thinking.forcedEffort = 'max';
++    choiceEntries['t1']!.effort = 'max';
++    ctx.get(IAgentProfileService).update({ modelAlias: 'kimi4', thinkingLevel: 'max' });
++    await lifecycle.remove(lifecycle.get(ids[0]!)!);
++    await runChild(ids[0]!);
++    expect(requests.at(-1)).toEqual({ model: 'flash', effort: 'low' });
++    expect(childProfiles.find(p => p.data().subagentBinding?.choice === 't1')!.data().subagentBinding?.effort).toBe('low');
++    await spawnViaPool('main', 't2');
++    expect(requests.at(-1)).toEqual({ model: 'flash', effort: 'high' });
++    await spawnViaPool(ids[0]!, 'primary');
++    expect(requests.at(-1)).toEqual({ model: 'flash', effort: 'low' });
++    await expect(lifecycle.fork(lifecycle.get(ids[0]!)!, { binding: { thinking: 'max' } })).rejects.toThrow('immutable');
++    await lifecycle.fork(lifecycle.get(ids[0]!)!, { agentId: 'forked-pool-child' });
++    await runChild('forked-pool-child');
++    expect(requests.at(-1)).toEqual({ model: 'flash', effort: 'low' });
++    const restored = lifecycle.handleOf(ids[0]!)!.accessor.get(IAgentProfileService);
++    const count = requests.length;
++    await ctx.get(IConfigService).replace('models', { ...config.models, flash: { ...config.models['flash']!, supportEfforts: ['high', 'max'] } }, ConfigTarget.Memory);
++    expect(() => restored.resolveRequestParams()).toThrow();
++    await ctx.get(IConfigService).replace('models', { kimi3: config.models['kimi3'], kimi4: config.models['kimi4'] }, ConfigTarget.Memory);
++    expect(() => restored.resolveModelContext()).toThrow();
++    expect(requests.length).toBe(count);
++  } finally { await ctx.dispose(); }
++}, 15000);
++
++class PoolTestAppendStore implements IAppendLogStore {
++  declare readonly _serviceBrand: undefined;
++  private records = new Map<string, unknown[]>();
++  readonly onDidWrite = Event.None as IAppendLogStore['onDidWrite'];
++  append<R>(scope: string, key: string, record: R): void { const id = `${scope}/${key}`; this.records.set(id, [...(this.records.get(id) ?? []), structuredClone(record)]); }
++  async *read<R>(scope: string, key: string): AsyncIterable<R> { for (const record of this.records.get(`${scope}/${key}`) ?? []) yield structuredClone(record) as R; }
++  rewrite<R>(scope: string, key: string, records: readonly R[]): Promise<void> { this.records.set(`${scope}/${key}`, structuredClone([...records])); return Promise.resolve(); }
++  flush(): Promise<void> { return Promise.resolve(); }
++  flushLog(): Promise<void> { return Promise.resolve(); }
++  close(): Promise<void> { return Promise.resolve(); }
++  acquire() { return { dispose() {} }; }
++  drainRetirements(): Promise<void> { return Promise.resolve(); }
++}
++
++class PoolTestRuntimeResolver implements IRuntimeResolver {
++  declare readonly _serviceBrand: undefined;
++  private readonly runtime: LocalRuntime;
++  constructor(
++    @IHostEnvironment environment: IHostEnvironment,
++    @IHostFileSystem fs: IHostFileSystem,
++    @IHostProcessService processes: IHostProcessService,
++    @IHostTerminalService terminal: IHostTerminalService,
++  ) { this.runtime = new LocalRuntime('test-workspace', environment, fs, processes, terminal); }
++  inspect(_binding: RuntimeBinding): Runtime { return this.runtime; }
++  acquire(_binding: RuntimeBinding, required: readonly RuntimeCapability[] = []): RuntimeLease {
++    if (required.some(capability => !this.runtime.capabilities.has(capability))) throw new Error('test runtime capability missing');
++    return { runtime: this.runtime, track: resource => resource, dispose: () => {} };
++  }
++}
+diff --git a/packages/agent-core-v2/test/session/subagent/spawn.test.ts b/packages/agent-core-v2/test/session/subagent/spawn.test.ts
+index 9705973de..c53ff582c 100644
+--- a/packages/agent-core-v2/test/session/subagent/spawn.test.ts
++++ b/packages/agent-core-v2/test/session/subagent/spawn.test.ts
+@@ -78,6 +78,7 @@ describe('SessionSubagentService planSpawn and spawn', () => {
+     return {
+       _serviceBrand: undefined,
+       data: () => data,
++      getEffectiveThinkingLevel: () => data.thinkingLevel,
+       getActiveToolNames: () => data.activeToolNames,
+     } as unknown as IAgentProfileService;
+   }
+diff --git a/packages/node-sdk/src/config/schema.ts b/packages/node-sdk/src/config/schema.ts
+index 4a19d4401..b9be38bee 100644
+--- a/packages/node-sdk/src/config/schema.ts
++++ b/packages/node-sdk/src/config/schema.ts
+@@ -91,10 +91,16 @@ export const ModelAliasSchema = ModelAliasBaseSchema.extend({
+ 
+ export type ModelAlias = z.infer<typeof ModelAliasSchema>;
+ 
++export const SubagentPoolEntrySchema = z.object({
++  model: z.string().min(1),
++  effort: z.string().min(1).refine((value) => value.trim() === value && value !== 'on' && value !== 'off'),
++  description: z.string(),
++}).strict();
++
+ export const SecondaryModelConfigSchema = ModelAliasOverrideSchema.extend({
+   model: z.string().min(1).optional(),
+   defaultModel: z.string().min(1).optional(),
+-  models: z.record(z.string(), z.string()).optional(),
++  models: z.record(z.string(), z.union([z.string(), SubagentPoolEntrySchema])).optional(),
+   force: z.boolean().optional(),
+ });
+ 
+diff --git a/packages/node-sdk/src/config/secondary-model.ts b/packages/node-sdk/src/config/secondary-model.ts
+index 89a7178c0..f734bd9a9 100644
+--- a/packages/node-sdk/src/config/secondary-model.ts
++++ b/packages/node-sdk/src/config/secondary-model.ts
+@@ -45,6 +45,10 @@ export function applySecondaryModelConfig(config: KimiConfig, env: Env = process
+     };
+   }
+ 
++  if (Object.values(secondary?.models ?? {}).some((entry) => typeof entry !== 'string') && secondary?.model !== undefined) {
++    throw new Error('[secondary_model] object pool entries cannot be combined with legacy model metadata synthesis');
++  }
++
+   let next = secondary === config.secondaryModel ? config : { ...config, secondaryModel: secondary };
+ 
+   const patch = secondaryModelPatch(secondary);
+diff --git a/packages/node-sdk/src/config/toml.ts b/packages/node-sdk/src/config/toml.ts
+index 581d75d2f..a4a97d2ed 100644
+--- a/packages/node-sdk/src/config/toml.ts
++++ b/packages/node-sdk/src/config/toml.ts
+@@ -186,6 +186,9 @@ function salvageConfigData(transformed: Record<string, unknown>): SalvageResult
+     if (result.success) {
+       return { config: result.data, dropped };
+     }
++    if (result.error.issues.some((issue) => issue.path[0] === 'secondaryModel')) {
++      throw new KimiError(ErrorCodes.CONFIG_INVALID, `Invalid secondary_model: ${formatConfigValidationError(result.error)}`, { cause: result.error });
++    }
+     let deletedAny = false;
+     for (const issue of result.error.issues) {
+       const [section, entry] = issue.path;
+diff --git a/packages/node-sdk/test/config.test.ts b/packages/node-sdk/test/config.test.ts
+index 01e708c21..297b4329d 100644
+--- a/packages/node-sdk/test/config.test.ts
++++ b/packages/node-sdk/test/config.test.ts
+@@ -1,11 +1,11 @@
+-import { mkdtemp, rm } from 'node:fs/promises';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ 
+ import { afterEach, describe, expect, it } from 'vitest';
+ 
+ import { createKimiConfigRpc } from '#/index';
+-import { parseConfigString } from '#/config/index';
++import { configToTomlData, loadRuntimeConfigSafe, parseConfigString } from '#/config/index';
+ 
+ const toPosix = (p: string): string => p.replaceAll('\\', '/');
+ 
+@@ -70,3 +70,23 @@ api_key_env = "ACME_API_KEY"
+     expect(parseConfigString(text).providers['acme']?.apiKeyEnv).toBe('ACME_API_KEY');
+   });
+ });
++
++
++describe('secondary pool object TOML', () => {
++  it('preserves choice keys and object values through serialization', () => {
++    const config = parseConfigString('[secondary_model]\ndefault_model="review"\n[secondary_model.models.review]\nmodel="canonical"\neffort="low"\ndescription="Review"');
++    expect(config.secondaryModel?.models?.['review']).toEqual({ model: 'canonical', effort: 'low', description: 'Review' });
++    expect(configToTomlData(config)['secondary_model']).toMatchObject({ default_model: 'review', models: { review: { model: 'canonical', effort: 'low', description: 'Review' } } });
++  });
++  it('rejects unknown entry fields instead of stripping them', () => {
++    expect(() => parseConfigString('[secondary_model]\ndefault_model="review"\n[secondary_model.models.review]\nmodel="canonical"\neffort="low"\ndescription="Review"\nextra=true')).toThrow();
++  });
++});
++
++
++it('fails closed when safe config loading encounters malformed pool objects', async () => {
++  const dir = await makeTempDir();
++  const file = join(dir, 'config.toml');
++  await writeFile(file, '[secondary_model]\ndefault_model="review"\n[secondary_model.models.review]\nmodel="canonical"\neffort="low"\ndescription="Review"\nextra=true');
++  expect(() => loadRuntimeConfigSafe(file, {})).toThrow('secondary_model');
++});

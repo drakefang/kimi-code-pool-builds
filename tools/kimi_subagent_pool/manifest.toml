@@ -1,0 +1,21 @@
+schema = "nxrouter-kimi-recipe/v1"
+# 官方基线、真实 patch 字节与工具链冻结；不代表远端 release 已发布。
+state = "frozen"
+
+[upstream]
+repository = "https://github.com/MoonshotAI/kimi-code.git"
+revision = "f67e6398fb3210ad8ace970e2dfd5bcc984ed61f"
+
+[build]
+platform = "windows-x64"
+package_version = "2.1.1"
+node = "26.1.0"
+pnpm = "10.33.0"
+pnpm_lock_sha256 = "7b9643cee40805bdb4ce191dc8271f5729d3055f1e3dff7c62fcbc1cee68aea9"
+
+[[patches]]
+path = "patches/0001-independent-subagent-pool.patch"
+sha256 = "30f26824480490fd448e50bf01c55c894347e248a5186c7d64c6b7dca0ac2e0b"
+
+[verification]
+required_features = ["subagent-pool-entry/v1", "subagent-binding-replay/v1"]
