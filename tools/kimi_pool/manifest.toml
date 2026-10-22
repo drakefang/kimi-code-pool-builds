@@ -1,0 +1,15 @@
+schema = "nxclient-kimi-pool-recipe/v1"
+
+[upstream]
+repository = "https://github.com/MoonshotAI/kimi-code.git"
+revision = "b5e28fd6beac752a2cdcc0ff2f5fdf40e6494fbb"
+version = "2.3.0"
+
+[build]
+node = "26.1.0"
+pnpm = "10.33.0"
+platform = "win32-x64"
+patch = "patches/0001-independent-subagent-pool.patch"
+
+[verification]
+required_features = ["subagent-pool-entry/v1", "subagent-binding-replay/v1"]

@@ -1,58 +1,19 @@
-# Kimi Code 独立 subagent pool — Windows x64 预览制品
+# Kimi Code 独立子代理池 Windows 客户端
 
-这是由 NxRouter 维护的受控客户端 patch 与构建/下载工具，非 Moonshot 官方发行。
-官方源码基线 `f67e6398fb3210ad8ace970e2dfd5bcc984ed61f`（2.1.1），上游为
-[MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code)。MIT 许可和原版权通知见 LICENSE。
+当前固定版本：`kimi-2.3.0-pool-v1`，官方 Kimi Code 2.3.0 基线，Windows x64。它是独立补丁构建，提供不污染主模型列表的对象子代理池，并保持子代理 model/effort 的原生持久绑定。
 
-固定 tag 为 `kimi-2.1.1-pool-v1.1`。普通环境下载单 SEA `kimi.exe`，无需 Node、pnpm 或重新打包。
-需要 Python 3.11+ 和已登录的 GitHub CLI（gh）；按固定 tag 检出后运行：
+## 跨机器直接下载
 
-```powershell
-git clone --branch kimi-2.1.1-pool-v1.1 --single-branch https://github.com/drakefang/kimi-code-pool-builds.git
-cd kimi-code-pool-builds
-```
-
-仓库 `.gitattributes` 保留精确字节，即使 Windows core.autocrlf=true 也不改写 patch/LICENSE。初版 v1 的远端下载在该设置下被许可 hash 门禁拦截，已撤下；v1.1 只修复发布仓库检出约束，exe、recipe、ZIP 与 consumer receipt 不变。
-
-运行：
+需要 Git、Python 3.11+ 与 GitHub CLI `gh`，不需要 Node、pnpm 或本地编译。
 
 ```powershell
-python tools/kimi_subagent_pool/download.py --release-lock release-lock.json --cache-root <新的专用cache目录>
+git clone --branch kimi-2.3.0-pool-v1 --depth 1 https://github.com/drakefang/kimi-code-pool-builds.git
+Set-Location kimi-code-pool-builds
+python tools/kimi_pool/download.py --output <新的客户端目录>
 ```
 
-指定 NxRouter 实例以写入受控 executable descriptor（请先保留实例快照）：
+下载固定资产并校验 ZIP 与 exe 的发布完整性，输出 executable 位置。下载不会安装到 PATH，不修改日用 HOME、会话或 nxc 配置；后续安装时再显式指定 `[kimi].executable`。
 
-```powershell
-python tools/kimi_subagent_pool/download.py --release-lock release-lock.json --cache-root <专用cache目录> --write-descriptor --instance-dir <NxRouter实例目录>
-```
+ZIP 包含 `kimi.exe`、`build_info.json`、`verification.json`、`LICENSE`。构建配方、补丁和验收说明见 [tools/kimi_pool](tools/kimi_pool/README.md)。本构建经过原生 consumer/replay 和隔离真实请求验收；未调用真实付费上游。
 
-工具只消费固定 lock，校验 ZIP/exe/recipe/artifact/consumer receipt 和实际能力；不使用 latest，不安装全局 PATH，不修改主控默认模型。ZIP 恰含 kimi.exe、build_info.json、verification.json、LICENSE。下载与能力测试不调用模型。
-
-## 独立 pool 配置语义
-
-`secondary_model.models` 支持旧 string 提示及严格对象 `{model, effort, description}`。
-新 key 是 pool-only choice；canonical model 必须已存在并支持明确 effort。
-例如多个 choice 可绑定同一个 canonical model 的 low/high/max；不能再为 tier 添加全局 model alias。
-Agent.model/AgentSwarm 仍选择 choice，resolver 在创建 child 时绑定 canonical model/effort，并保存至 profile/replay。
-主控切换不污染已有 child；pool-bound caller 的 primary 继承其 durable binding；resume/fork 保留绑定及官方 fork 约束。
-未知字段、缺失模型和不支持 effort 明确报错，不静默继承或换路由。
-
-## 维护者构建
-
-一次构建供其它 Windows x64 环境下载。需固定 Node 26.1.0、pnpm 10.33.0、Python 和 Git。
-
-```powershell
-python tools/kimi_subagent_pool/build.py prepare --source <新的源码目录>
-python tools/kimi_subagent_pool/build.py build --source <源码目录> --output <新的产物目录> --node <node.exe> --pnpm-script <pnpm.cjs>
-```
-
-recipe 校验官方 SHA、patch、lock、源码 index、工具链，并执行 frozen install、15 package 构建与官方 SEA 流程。
-verification.json 只能由维护者在同源码候选真实 consumer/replay 测试通过后生成；不能用静态 capabilities 或 doctor 代替。
-升级重新冻结来源并重跑 resolver/profile/request consumer、SDK/TOML/TUI 和构建/下载矩阵，不能只修改版本号。
-
-## 预览验证边界
-
-发布候选已完成五档并行真实 child requester 的 mock/no-model 捕获、primary 下一层继承、持久 replay、fork、撤销模型/effort错误，以及 SDK/TUI/Swarm 定向测试和 SEA 构建。
-上游既有 config snapshot 失败及4项 import-boundary 失败在未 patch 基线复现，未宣称完整上游套件通过。
-本发布不证明真实 Provider、个人配置迁移或跨平台兼容，不改变 NxRouter 产品 Phase/Gate。
-新 binding home 不可仅靠换回旧 exe 或删除 marker 回退；须停止客户端并成对恢复整个迁移前隔离 home 与匹配 artifact/descriptor/config。
+历史 2.1.1 资产保持不变，使用时检出各自固定 tag，不混用不同版本的下载锁与工具。
